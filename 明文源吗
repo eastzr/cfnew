@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
-let authToken = '351c9981-04b6-4103-aa4b-864aa9c91469';
+let authToken = 'ab8f8296-223e-4cc3-867b-8c9b563603de';
 let fallbackAddress = 'ProxyIP.SG.CMLiussss.net';
 let fallbackPort = '443';
 let socks5Config = '';
