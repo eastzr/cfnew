@@ -949,7 +949,7 @@ function generateLinksFromSource(list, user, workerDomain) {
                 encryption: 'none', 
                 security: 'tls', 
                 sni: workerDomain, 
-                fp: 'randomized', 
+                fp: 'random', 
                 type: 'ws', 
                 host: workerDomain, 
                 path: wsPath 
