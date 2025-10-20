@@ -1,318 +1,233 @@
-import {
-    connect
-} from 'cloudflare:sockets';
-
-const UUID = '1f9d104e-ca0e-4202-ba4b-a0afb969c747';
-// 反向代理IP，无法访问时通过代理访问
-const DEFAULT_PROXY_IP = 'ProxyIP.US.CMLiussss.net:443'; // 来源：https://ipdb.030101.xyz/bestdomain/
-// 优选域名/IP
-const BEST_DOMAINS = ['bestcf.030101.xyz:443', 'japan.com:443', 'www.visa.com.sg:443', "www.visa.com.hk:443", "icook.hk:443", "icook.tw:443"]
-
+/*
+天书13（修改）手搓节点使用说明如下：
+  一、本程序预设：
+    1、USER_KEY=1f9d104e-ca0e-4202-ba4b-a0afb969c747（强烈建议部署时更换）;
+    2、ENABLE_FLOW_CONTROL=false（预设关闭,根据使用情况选择开启或关闭）;
+      开启使用控流可降低CPU超时的概率，提升连接稳定性，适合轻度使用，日常使用应该绰绰有余
+    3、FLOW_CHUNK_SIZE = 64; 单位字节，相当于分片大小
+  二、v2rayN客户端的单节点路径设置代理ip，通过代理客户端路径传递
+    1、socks5代理所有网站,格式：s5all=xxx
+    2、socks5代理cf相关的网站，非cf相关的网站走直连,格式：socks5=xxx或者socks5://xxx
+    3、proxyip代理cf相关的网站，非cf相关的网站走直连,格式：pyip=xxx或者proxyip=xxx
+    三种任选其一，如果不设置留空，cf相关的网站无法访问;
+  注意：workers、pages、snippets都可以部署，部署完后手搓443系6个端口节点veless+ws+tls
+*/
+import { connect } from 'cloudflare:sockets';
+const USER_KEY = '1f9d104e-ca0e-4202-ba4b-a0afb969c747';
+const ENABLE_FLOW_CONTROL = false;
+const FLOW_CHUNK_SIZE = 64;
 
 export default {
-    async fetch(req) {
-        const u = new URL(req.url);
-        if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-            return await handle_ws(req);
-        } else if (req.method === 'GET') {
-            if (u.pathname === '/') {
-                const html = "<h1>success</h1>";
-                return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-            } else if (u.pathname.toLowerCase().includes(`/${UUID}`)) {
-                return await handle_sub(req);
-            }
-        }
-
-        return new Response('error', { status: 404 });
+  async fetch(request) {
+    if (request.headers.get('Upgrade') === 'websocket') {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.send(new Uint8Array([0, 0]));
+      await startTransferPipeline(server, new URL(request.url));
+      return new Response(null, { status: 101, webSocket: client });
+    } else {
+      return new Response('Hello World!', { status: 200 });
     }
+  }
 };
 
-
-async function handle_sub(req) {
-    const url = new URL(req.url);
-    const workerDomain = url.hostname;
-
-    let links = gen_links(workerDomain);
-    let content = btoa(links.join('\n'));
-    return new Response(content, {
-        headers: {
-            'Content-Type': 'text/plain; charset=utf-8',
-            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        },
+async function startTransferPipeline(ws, url) {
+  let addrType, destHost, addrLen, tcpConn, firstPacket = false, firstPacketReady = null, writer, reader, sendQueue = Promise.resolve();
+  const tempPath = decodeURIComponent(url.pathname + url.search);
+  try {
+    ws.addEventListener('message', async event => {
+      if (!firstPacket) {
+        firstPacket = true;
+        firstPacketReady = parseFirstPacket(event.data);
+        sendQueue = sendQueue.then(() => firstPacketReady).catch(() => { });
+      } else {
+        sendQueue = sendQueue.then(async () => await writer.write(event.data)).catch(() => { });
+      }
     });
-}
-
-function gen_links(workerDomain) {
-    let links = [];
-    let i = 0;
-    const wsPath = encodeURIComponent('/?ed=2048');
-    const proto = atob("dmxlc3M=")
-
-    BEST_DOMAINS.forEach(item => {
-        i += 1;
-        let name = "snippet_" + i;
-        const wsParams = new URLSearchParams({
-            encryption: 'none',
-            security: 'tls',
-            sni: workerDomain,
-            fp: 'chrome',
-            type: 'ws',
-            host: workerDomain,
-            path: wsPath
-        });
-        links.push(`${proto}://${UUID}@${item}?${wsParams.toString()}#${encodeURIComponent(name)}`);
-    })
-    return links;
-}
-
-async function handle_ws(req) {
-    const [client, ws] = Object.values(new WebSocketPair());
-    ws.accept();
-
-    const u = new URL(req.url);
-
-    // 修复处理URL编码的查询参数  
-    if (u.pathname.includes('%3F')) {
-        const decoded = decodeURIComponent(u.pathname);
-        const queryIndex = decoded.indexOf('?');
-        if (queryIndex !== -1) {
-            u.search = decoded.substring(queryIndex);
-            u.pathname = decoded.substring(0, queryIndex);
+    async function parseFirstPacket(firstData) {
+      const binBuffer = new Uint8Array(firstData);
+      const formatVLKey = (a, i = 0) => [...a.slice(i, i + 16)].map(b => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
+      if (formatVLKey(binBuffer.slice(1, 17)) !== USER_KEY) throw new Error('UUID verification failed');
+      const portIndex = 18 + binBuffer[17] + 1;
+      const destPort = new DataView(binBuffer.buffer, portIndex, 2).getUint16(0);
+      if (destPort === 53) { // handle DNS-over-TCP tunneled queries
+        const dnsQuery = binBuffer.slice(portIndex + 9);
+        const dohResponse = await fetch('https://1.1.1.1/dns-query', {
+          method: 'POST',
+          headers: { 'content-type': 'application/dns-message' },
+          body: dnsQuery
+        })
+        const dohArray = await dohResponse.arrayBuffer();
+        const lenHeader = new Uint8Array([(dohArray.byteLength >> 8) & 0xff, dohArray.byteLength & 0xff]);
+        ws.send(await new Blob([lenHeader, dohArray]));
+        return;
+      }
+      const addrIndex = portIndex + 2;
+      addrType = binBuffer[addrIndex];
+      let addrInfoIndex = addrIndex + 1;
+      switch (addrType) {
+        case 1:
+          addrLen = 4;
+          destHost = binBuffer.slice(addrInfoIndex, addrInfoIndex + addrLen).join('.');
+          break;
+        case 2:
+          addrLen = binBuffer[addrInfoIndex];
+          addrInfoIndex += 1;
+          const domain = new TextDecoder().decode(binBuffer.slice(addrInfoIndex, addrInfoIndex + addrLen));
+          destHost = domain;
+          break;
+        case 3:
+          addrLen = 16;
+          const ipv6 = [];
+          const readIPv6 = new DataView(binBuffer.buffer, addrInfoIndex, 16);
+          for (let i = 0; i < 8; i++) ipv6.push(readIPv6.getUint16(i * 2).toString(16));
+          destHost = ipv6.join(':');
+          break;
+        default:
+          throw new Error('Invalid destination address');
+      }
+      const socksAllMatch = tempPath.match(/s5all\s*=\s*([^&]+(?:\d+)?)/i);
+      const socksAllMatchSpec = socksAllMatch ? socksAllMatch[1] : null;
+      if (socksAllMatchSpec) {
+        tcpConn = await createSocks5Connection(addrType, destHost, destPort, socksAllMatchSpec);
+      } else {
+        try {
+          if (addrType === 3) {
+            const ipv6Host = `[${destHost}]`;
+            tcpConn = connect({ hostname: ipv6Host, port: destPort });
+          } else {
+            tcpConn = connect({ hostname: destHost, port: destPort });
+          }
+          await tcpConn.opened;
+        } catch {
+          const pyipMatch = tempPath.match(/p(?:rox)?yip\s*=\s*([^&]+(?:\d+)?)/i);
+          const pyipSpec = pyipMatch ? pyipMatch[1] : null;
+          if (pyipSpec) {
+            const [proxyHost, proxyPort] = parseHostPort(pyipSpec);
+            tcpConn = connect({ hostname: proxyHost, port: proxyPort });
+          } else {
+            const socksMatch = tempPath.match(/socks5\s*(?:=|(?::\/\/))\s*([^&]+(?:\d+)?)/i);
+            const socksSpec = socksMatch ? socksMatch[1] : null;
+            if (socksSpec) {
+              tcpConn = await createSocks5Connection(addrType, destHost, destPort, socksSpec);
+            } else {
+              console.error('Connection failed: No proxy method specified');
+            }
+          }
         }
+      }
+      await tcpConn.opened;
+      writer = tcpConn.writable.getWriter();
+      reader = tcpConn.readable.getReader();
+      const initialPayload = binBuffer.slice(addrInfoIndex + addrLen);
+      if (initialPayload) await writer.write(initialPayload);
+      startBackPipe();
+      return;
     }
-
-    const mode = u.searchParams.get('mode') || 'proxy';
-    const s5Param = u.searchParams.get('s5');
-    const proxyParam = u.searchParams.get('proxyip');
-    const path = s5Param ? s5Param : u.pathname.slice(1);
-
-    // 解析SOCKS5和ProxyIP
-    const socks5 = path.includes('@') ? (() => {
-        const [cred, server] = path.split('@');
-        const [user, pass] = cred.split(':');
-        const [host, port = 443] = server.split(':');
-        return {
-            user,
-            pass,
-            host,
-            port: +port
-        };
-    })() : null;
-    const PROXY_IP = proxyParam ? String(proxyParam) : DEFAULT_PROXY_IP;
-
-    // auto模式参数顺序（按URL参数位置）
-    const getOrder = () => {
-        if (mode === 'proxy') return ['direct', 'proxy'];
-        if (mode !== 'auto') return [mode];
-        const order = [];
-        const searchStr = u.search.slice(1);
-        for (const pair of searchStr.split('&')) {
-            const key = pair.split('=')[0];
-            if (key === 'direct') order.push('direct');
-            else if (key === 's5') order.push('s5');
-            else if (key === 'proxyip') order.push('proxy');
+    async function startBackPipe() {
+      while (true) {
+        const { done: streamEnd, value: returnData } = await reader.read();
+        if (returnData && returnData.length > 0) {
+          if (ENABLE_FLOW_CONTROL) {
+            let offset = 0;
+            while (offset < returnData.length) {
+              const chunk = returnData.slice(offset, offset + FLOW_CHUNK_SIZE);
+              sendQueue = sendQueue.then(() => ws.send(chunk)).catch(() => { });
+              offset += FLOW_CHUNK_SIZE;
+            }
+          } else {
+            sendQueue = sendQueue.then(() => ws.send(returnData)).catch(() => { });
+          }
         }
-        // 没有参数时默认direct
-        return order.length ? order : ['direct'];
-    };
+        if (streamEnd) break;
+      }
+    }
+  } catch (e) {
+    return new Response(`Handshake failed: ${e}`, { status: 500 });
+  }
+}
 
-    let remote = null,
-        udpWriter = null,
-        isDNS = false;
-
-    // SOCKS5连接
-    const socks5Connect = async (targetHost, targetPort) => {
-        const sock = connect({
-            hostname: socks5.host,
-            port: socks5.port
-        });
-        await sock.opened;
-        const w = sock.writable.getWriter();
-        const r = sock.readable.getReader();
-        await w.write(new Uint8Array([5, 2, 0, 2]));
-        const auth = (await r.read()).value;
-        if (auth[1] === 2 && socks5.user) {
-            const user = new TextEncoder().encode(socks5.user);
-            const pass = new TextEncoder().encode(socks5.pass);
-            await w.write(new Uint8Array([1, user.length, ...user, pass.length, ...pass]));
-            await r.read();
+async function createSocks5Connection(addrType, destHost, destPort, socks5Spec) {
+  let socks5Conn, convertedHost, writer, reader;
+  try {
+    const { username, password, host, port } = getSocks5Account(socks5Spec);
+    socks5Conn = connect({ hostname: host, port: port });
+    await socks5Conn.opened;
+    writer = socks5Conn.writable.getWriter();
+    reader = socks5Conn.readable.getReader();
+    const encoder = new TextEncoder();
+    const authReq = new Uint8Array([5, 2, 0, 2]);
+    await writer.write(authReq);
+    const authResp = (await reader.read()).value;
+    if (authResp[1] === 0x02) {
+      if (!username || !password) {
+        throw new Error(`missing username or password`);
+      }
+      const userPassPacket = new Uint8Array([1, username.length, ...encoder.encode(username), password.length, ...encoder.encode(password)]);
+      await writer.write(userPassPacket);
+      const userPassResp = (await reader.read()).value;
+      if (userPassResp[0] !== 0x01 || userPassResp[1] !== 0x00) {
+        throw new Error(`username/password error`);
+      }
+    }
+    switch (addrType) {
+      case 1:
+        convertedHost = new Uint8Array([1, ...destHost.split('.').map(Number)]);
+        break;
+      case 2:
+        convertedHost = new Uint8Array([3, destHost.length, ...encoder.encode(destHost)]);
+        break;
+      case 3:
+        convertedHost = toSocks5IPv6(destHost);
+        function toSocks5IPv6(original) {
+          const trim = original.startsWith('[') && original.endsWith(']') ? original.slice(1, -1) : original;
+          const parts = trim.split('::');
+          const prefix = parts[0] ? parts[0].split(':').filter(Boolean) : [];
+          const suffix = parts[1] ? parts[1].split(':').filter(Boolean) : [];
+          const fillCount = 8 - (prefix.length + suffix.length);
+          if (fillCount < 0) throw new Error('invalid ipv6');
+          const full = [...prefix, ...Array(fillCount).fill('0'), ...suffix];
+          const bytes = full.flatMap(field => {
+            const val = parseInt(field || '0', 16);
+            return [(val >> 8) & 0xff, val & 0xff];
+          });
+          return new Uint8Array([0x04, ...bytes]);
         }
-        const domain = new TextEncoder().encode(targetHost);
-        await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, targetPort >> 8,
-            targetPort & 0xff
-        ]));
-        await r.read();
-        w.releaseLock();
-        r.releaseLock();
-        return sock;
-    };
+        break;
+    }
+    const buildReq = new Uint8Array([5, 1, 0, ...convertedHost, destPort >> 8, destPort & 0xff]);
+    await writer.write(buildReq);
+    const checkResp = (await reader.read()).value;
+    if (checkResp[0] !== 0x05 || checkResp[1] !== 0x00) {
+      throw new Error(`target connection failed, destHost: ${destHost}, addrType: ${addrType}`);
+    }
+    writer.releaseLock();
+    reader.releaseLock();
+    return socks5Conn;
+  } catch {
+    console.log('SOCKS5 account failed')
+  }
+  writer?.releaseLock();
+  reader?.releaseLock();
+  await socks5Conn?.close();
+  throw new Error(`SOCKS5 account failed`);
+}
 
-    new ReadableStream({
-        start(ctrl) {
-            ws.addEventListener('message', e => ctrl.enqueue(e.data));
-            ws.addEventListener('close', () => {
-                remote?.close();
-                ctrl.close();
-            });
-            ws.addEventListener('error', () => {
-                remote?.close();
-                ctrl.error();
-            });
+function getSocks5Account(spec) {
+  const [latter, former] = spec.split(/@?([\d\[\]a-z.:]+(?::\d+)?)$/i);
+  let [username, password] = latter.split(':');
+  if (!password) { password = '' };
+  const [host, port] = parseHostPort(former);
+  return { username, password, host, port };
+}
 
-            const early = req.headers.get('sec-websocket-protocol');
-            if (early) {
-                try {
-                    ctrl.enqueue(Uint8Array.from(atob(early.replace(/-/g, '+').replace(/_/g, '/')),
-                        c => c.charCodeAt(0)).buffer);
-                } catch { }
-            }
-        }
-    }).pipeTo(new WritableStream({
-        async write(data) {
-            if (isDNS) return udpWriter?.write(data);
-            if (remote) {
-                const w = remote.writable.getWriter();
-                await w.write(data);
-                w.releaseLock();
-                return;
-            }
-
-            if (data.byteLength < 24) return;
-
-            // UUID验证
-            const uuidBytes = new Uint8Array(data.slice(1, 17));
-            const expectedUUID = UUID.replace(/-/g, '');
-            for (let i = 0; i < 16; i++) {
-                if (uuidBytes[i] !== parseInt(expectedUUID.substr(i * 2, 2), 16)) return;
-            }
-
-            const view = new DataView(data);
-            const optLen = view.getUint8(17);
-            const cmd = view.getUint8(18 + optLen);
-            if (cmd !== 1 && cmd !== 2) return;
-
-            let pos = 19 + optLen;
-            const port = view.getUint16(pos);
-            const type = view.getUint8(pos + 2);
-            pos += 3;
-
-            let addr = '';
-            if (type === 1) {
-                addr =
-                    `${view.getUint8(pos)}.${view.getUint8(pos + 1)}.${view.getUint8(pos + 2)}.${view.getUint8(pos + 3)}`;
-                pos += 4;
-            } else if (type === 2) {
-                const len = view.getUint8(pos++);
-                addr = new TextDecoder().decode(data.slice(pos, pos + len));
-                pos += len;
-            } else if (type === 3) {
-                const ipv6 = [];
-                for (let i = 0; i < 8; i++, pos += 2) ipv6.push(view.getUint16(pos)
-                    .toString(16));
-                addr = ipv6.join(':');
-            } else return;
-
-            const header = new Uint8Array([data[0], 0]);
-            const payload = data.slice(pos);
-
-            // UDP DNS
-            if (cmd === 2) {
-                if (port !== 53) return;
-                isDNS = true;
-                let sent = false;
-                const {
-                    readable,
-                    writable
-                } = new TransformStream({
-                    transform(chunk, ctrl) {
-                        for (let i = 0; i < chunk.byteLength;) {
-                            const len = new DataView(chunk.slice(i, i + 2))
-                                .getUint16(0);
-                            ctrl.enqueue(chunk.slice(i + 2, i + 2 + len));
-                            i += 2 + len;
-                        }
-                    }
-                });
-
-                readable.pipeTo(new WritableStream({
-                    async write(query) {
-                        try {
-                            const resp = await fetch(
-                                'https://1.1.1.1/dns-query', {
-                                method: 'POST',
-                                headers: {
-                                    'content-type': 'application/dns-message'
-                                },
-                                body: query
-                            });
-                            if (ws.readyState === 1) {
-                                const result = new Uint8Array(await resp
-                                    .arrayBuffer());
-                                ws.send(new Uint8Array([...(sent ? [] :
-                                    header), result
-                                        .length >> 8, result
-                                            .length & 0xff, ...result
-                                ]));
-                                sent = true;
-                            }
-                        } catch { }
-                    }
-                }));
-                udpWriter = writable.getWriter();
-                return udpWriter.write(payload);
-            }
-
-            // TCP连接
-            let sock = null;
-            for (const method of getOrder()) {
-                try {
-                    if (method === 'direct') {
-                        sock = connect({
-                            hostname: addr,
-                            port
-                        });
-                        await sock.opened;
-                        break;
-                    } else if (method === 's5' && socks5) {
-                        sock = await socks5Connect(addr, port);
-                        break;
-                    } else if (method === 'proxy' && PROXY_IP) {
-                        const [ph, pp = port] = PROXY_IP.split(':');
-                        sock = connect({
-                            hostname: ph,
-                            port: +pp || port
-                        });
-                        await sock.opened;
-                        break;
-                    }
-                } catch { }
-            }
-
-            if (!sock) return;
-
-            remote = sock;
-            const w = sock.writable.getWriter();
-            await w.write(payload);
-            w.releaseLock();
-
-            let sent = false;
-            sock.readable.pipeTo(new WritableStream({
-                write(chunk) {
-                    if (ws.readyState === 1) {
-                        ws.send(sent ? chunk : new Uint8Array([...header, ...
-                            new Uint8Array(chunk)
-                        ]));
-                        sent = true;
-                    }
-                },
-                close: () => ws.readyState === 1 && ws.close(),
-                abort: () => ws.readyState === 1 && ws.close()
-            })).catch(() => { });
-        }
-    })).catch(() => { });
-
-    return new Response(null, {
-        status: 101,
-        webSocket: client
-    });
+function parseHostPort(hostSeg) {
+  let host, ipv6, port;
+  if (hostSeg.startsWith('[') && hostSeg.includes(']')) {
+    [ipv6, port = 443] = hostSeg.split(']:');
+    host = ipv6.endsWith(']') ? `${ipv6}` : `${ipv6}]`;
+  } else {
+    [host, port = 443] = hostSeg.split(':');
+  }
+  return [host, Number(port)];
 }
