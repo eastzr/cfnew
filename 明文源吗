@@ -1,233 +1,299 @@
-/*
-天书13（修改）手搓节点使用说明如下：
-  一、本程序预设：
-    1、USER_KEY=1f9d104e-ca0e-4202-ba4b-a0afb969c747（强烈建议部署时更换）;
-    2、ENABLE_FLOW_CONTROL=false（预设关闭,根据使用情况选择开启或关闭）;
-      开启使用控流可降低CPU超时的概率，提升连接稳定性，适合轻度使用，日常使用应该绰绰有余
-    3、FLOW_CHUNK_SIZE = 64; 单位字节，相当于分片大小
-  二、v2rayN客户端的单节点路径设置代理ip，通过代理客户端路径传递
-    1、socks5代理所有网站,格式：s5all=xxx
-    2、socks5代理cf相关的网站，非cf相关的网站走直连,格式：socks5=xxx或者socks5://xxx
-    3、proxyip代理cf相关的网站，非cf相关的网站走直连,格式：pyip=xxx或者proxyip=xxx
-    三种任选其一，如果不设置留空，cf相关的网站无法访问;
-  注意：workers、pages、snippets都可以部署，部署完后手搓443系6个端口节点veless+ws+tls
-*/
-import { connect } from 'cloudflare:sockets';
-const USER_KEY = '1f9d104e-ca0e-4202-ba4b-a0afb969c747';
-const ENABLE_FLOW_CONTROL = false;
-const FLOW_CHUNK_SIZE = 64;
 
-export default {
-  async fetch(request) {
-    if (request.headers.get('Upgrade') === 'websocket') {
-      const [client, server] = Object.values(new WebSocketPair());
-      server.accept();
-      server.send(new Uint8Array([0, 0]));
-      await startTransferPipeline(server, new URL(request.url));
-      return new Response(null, { status: 101, webSocket: client });
-    } else {
-      return new Response('Hello World!', { status: 200 });
-    }
-  }
+/**
+ * StallTCP1.3修复版 
+ * 修复日常的小数据请求更重要的逻辑问题。
+ * 修复下载队列在长期频繁的峰值状态会导致上传队列被阻塞问题。
+ * 适配了ProxyIP使用， 路径格式，/proxyip=ip:port
+ * 🫡致敬原版作者：Alexandre_Kojeve
+ * 天诚技术交流群@zyssadmin出品
+ */
+
+import { connect } from 'cloudflare:sockets';
+const UUID = "1f9d104e-ca0e-4202-ba4b-a0afb969c747"; //使用时请更换成合法UUID。
+const MAX_PENDING = 2097152, KEEPALIVE = 15000, STALL_TO = 8000, MAX_STALL = 12, MAX_RECONN = 24;
+const buildUUID = (a, i) => Array.from(a.slice(i, i + 16)).map(n => n.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
+const extractAddr = b => {
+  const o1 = 18 + b[17] + 1, p = (b[o1] << 8) | b[o1 + 1], t = b[o1 + 2]; let o2 = o1 + 3, h, l;
+  switch (t) {
+    case 1: l = 4; h = b.slice(o2, o2 + l).join('.'); break;
+    case 2: l = b[o2++]; h = new TextDecoder().decode(b.slice(o2, o2 + l)); break;
+    case 3: l = 16; h = `[${Array.from({ length: 8 }, (_, i) => ((b[o2 + i * 2] << 8) | b[o2 + i * 2 + 1]).toString(16)).join(':')}]`; break;
+    default: throw new Error('Invalid address type.');
+  } return { host: h, port: p, payload: b.slice(o2 + l) };
 };
 
-async function startTransferPipeline(ws, url) {
-  let addrType, destHost, addrLen, tcpConn, firstPacket = false, firstPacketReady = null, writer, reader, sendQueue = Promise.resolve();
-  const tempPath = decodeURIComponent(url.pathname + url.search);
-  try {
-    ws.addEventListener('message', async event => {
-      if (!firstPacket) {
-        firstPacket = true;
-        firstPacketReady = parseFirstPacket(event.data);
-        sendQueue = sendQueue.then(() => firstPacketReady).catch(() => { });
-      } else {
-        sendQueue = sendQueue.then(async () => await writer.write(event.data)).catch(() => { });
+const parseAddressPort = (addressSegment) => {
+  let address, port;
+  if (addressSegment.startsWith('[')) {
+    const [ipv6Address, portStr = 443] = addressSegment.slice(1, -1).split(']:');
+    address = `[${ipv6Address}]`; port = portStr;
+  } else { 
+    [address, port = 443] = addressSegment.split(':'); 
+  } 
+  return [address, port];
+}
+
+class Pool {
+  constructor() { this.buf = new ArrayBuffer(16384); this.ptr = 0; this.pool = []; this.max = 8; this.large = false; }
+  alloc = s => {
+    if (s <= 4096 && s <= 16384 - this.ptr) { const v = new Uint8Array(this.buf, this.ptr, s); this.ptr += s; return v; } const r = this.pool.pop();
+    if (r && r.byteLength >= s) return new Uint8Array(r.buffer, 0, s); return new Uint8Array(s);
+  };
+  free = b => {
+    if (b.buffer === this.buf) { this.ptr = Math.max(0, this.ptr - b.length); return; }
+    if (this.pool.length < this.max && b.byteLength >= 1024) this.pool.push(b);
+  }; enableLarge = () => { this.large = true; }; reset = () => { this.ptr = 0; this.pool.length = 0; this.large = false; };
+}
+
+export default {
+  async fetch(r) { 
+    if (r.headers.get('Upgrade') !== 'websocket') return new Response('OK', { status: 200 });
+    
+    const u = new URL(r.url); 
+    let proxyIPConfig = null;
+    if (u.pathname.includes('/proxyip=')) {
+      try {
+        const proxyParam = u.pathname.split('/proxyip=')[1].split('/')[0];
+        const [address, port] = parseAddressPort(proxyParam); 
+        proxyIPConfig = { address, port: +port }; 
+      } catch (e) {
+        console.error('Failed to parse proxyip:', e.message);
       }
-    });
-    async function parseFirstPacket(firstData) {
-      const binBuffer = new Uint8Array(firstData);
-      const formatVLKey = (a, i = 0) => [...a.slice(i, i + 16)].map(b => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
-      if (formatVLKey(binBuffer.slice(1, 17)) !== USER_KEY) throw new Error('UUID verification failed');
-      const portIndex = 18 + binBuffer[17] + 1;
-      const destPort = new DataView(binBuffer.buffer, portIndex, 2).getUint16(0);
-      if (destPort === 53) { // handle DNS-over-TCP tunneled queries
-        const dnsQuery = binBuffer.slice(portIndex + 9);
-        const dohResponse = await fetch('https://1.1.1.1/dns-query', {
-          method: 'POST',
-          headers: { 'content-type': 'application/dns-message' },
-          body: dnsQuery
-        })
-        const dohArray = await dohResponse.arrayBuffer();
-        const lenHeader = new Uint8Array([(dohArray.byteLength >> 8) & 0xff, dohArray.byteLength & 0xff]);
-        ws.send(await new Blob([lenHeader, dohArray]));
-        return;
-      }
-      const addrIndex = portIndex + 2;
-      addrType = binBuffer[addrIndex];
-      let addrInfoIndex = addrIndex + 1;
-      switch (addrType) {
-        case 1:
-          addrLen = 4;
-          destHost = binBuffer.slice(addrInfoIndex, addrInfoIndex + addrLen).join('.');
-          break;
-        case 2:
-          addrLen = binBuffer[addrInfoIndex];
-          addrInfoIndex += 1;
-          const domain = new TextDecoder().decode(binBuffer.slice(addrInfoIndex, addrInfoIndex + addrLen));
-          destHost = domain;
-          break;
-        case 3:
-          addrLen = 16;
-          const ipv6 = [];
-          const readIPv6 = new DataView(binBuffer.buffer, addrInfoIndex, 16);
-          for (let i = 0; i < 8; i++) ipv6.push(readIPv6.getUint16(i * 2).toString(16));
-          destHost = ipv6.join(':');
-          break;
-        default:
-          throw new Error('Invalid destination address');
-      }
-      const socksAllMatch = tempPath.match(/s5all\s*=\s*([^&]+(?:\d+)?)/i);
-      const socksAllMatchSpec = socksAllMatch ? socksAllMatch[1] : null;
-      if (socksAllMatchSpec) {
-        tcpConn = await createSocks5Connection(addrType, destHost, destPort, socksAllMatchSpec);
-      } else {
-        try {
-          if (addrType === 3) {
-            const ipv6Host = `[${destHost}]`;
-            tcpConn = connect({ hostname: ipv6Host, port: destPort });
-          } else {
-            tcpConn = connect({ hostname: destHost, port: destPort });
-          }
-          await tcpConn.opened;
-        } catch {
-          const pyipMatch = tempPath.match(/p(?:rox)?yip\s*=\s*([^&]+(?:\d+)?)/i);
-          const pyipSpec = pyipMatch ? pyipMatch[1] : null;
-          if (pyipSpec) {
-            const [proxyHost, proxyPort] = parseHostPort(pyipSpec);
-            tcpConn = connect({ hostname: proxyHost, port: proxyPort });
-          } else {
-            const socksMatch = tempPath.match(/socks5\s*(?:=|(?::\/\/))\s*([^&]+(?:\d+)?)/i);
-            const socksSpec = socksMatch ? socksMatch[1] : null;
-            if (socksSpec) {
-              tcpConn = await createSocks5Connection(addrType, destHost, destPort, socksSpec);
-            } else {
-              console.error('Connection failed: No proxy method specified');
-            }
-          }
-        }
-      }
-      await tcpConn.opened;
-      writer = tcpConn.writable.getWriter();
-      reader = tcpConn.readable.getReader();
-      const initialPayload = binBuffer.slice(addrInfoIndex + addrLen);
-      if (initialPayload) await writer.write(initialPayload);
-      startBackPipe();
-      return;
     }
-    async function startBackPipe() {
+    
+    const { 0: c, 1: s } = new WebSocketPair(); s.accept(); s.send(new Uint8Array([0, 0])); 
+    handle(s, proxyIPConfig); 
+    return new Response(null, { status: 101, webSocket: c });}
+};
+
+const handle = (ws, proxyIPConfig) => {
+  const pool = new Pool(); let sock, w, r, info, first = true, rxBytes = 0, stalls = 0, reconns = 0;
+  let lastAct = Date.now(), conn = false, reading = false, writing = false; // <-- 增加 'writing' 标志
+  const tmrs = {}, pend = [];
+  let pendBytes = 0, score = 1.0, lastChk = Date.now(), lastRx = 0, succ = 0, fail = 0;
+  let stats = { tot: 0, cnt: 0, big: 0, win: 0, ts: Date.now() }; 
+  
+  // --- MODIFIED (Problem 1) ---
+  // 默认模式改为 'buffered'，以合并小请求
+  let mode = 'buffered', avgSz = 0, tputs = [];
+  // --- END MODIFIED ---
+
+  const updateMode = s => {
+    stats.tot += s; stats.cnt++; if (s > 8192) stats.big++; avgSz = avgSz * 0.9 + s * 0.1; const now = Date.now();
+    if (now - stats.ts > 1000) {
+      const rate = stats.win; tputs.push(rate); if (tputs.length > 5) tputs.shift(); stats.win = s; stats.ts = now;
+      const avg = tputs.reduce((a, b) => a + b, 0) / tputs.length;
+      if (stats.cnt >= 20) {
+        // --- MODIFIED (Problem 1) ---
+        // 反转逻辑：大流量/大包 -> direct (零拷贝)
+        if (avg > 20971520 && avgSz > 16384) { 
+          if (mode !== 'direct') { mode = 'direct'; } 
+        }
+        // 小流量/小包 -> buffered (合并)
+        else if (avg < 10485760 || avgSz < 8192) { 
+          if (mode !== 'buffered') { mode = 'buffered'; pool.enableLarge(); } 
+        }
+        // 中间 -> adaptive
+        else { 
+          if (mode !== 'adaptive') mode = 'adaptive'; 
+        }
+        // --- END MODIFIED ---
+      }} else { stats.win += s; }
+  };
+  
+  const readLoop = async () => {
+    if (reading) return; reading = true; let batch = [], bSz = 0, bTmr = null;
+    const flush = () => {
+      if (!bSz) return; const m = new Uint8Array(bSz); let p = 0;
+      for (const c of batch) { m.set(c, p); p += c.length; }
+      if (ws.readyState === 1) ws.send(m);
+      batch = []; bSz = 0; if (bTmr) { clearTimeout(bTmr); bTmr = null; }
+    };
+    try {
       while (true) {
-        const { done: streamEnd, value: returnData } = await reader.read();
-        if (returnData && returnData.length > 0) {
-          if (ENABLE_FLOW_CONTROL) {
-            let offset = 0;
-            while (offset < returnData.length) {
-              const chunk = returnData.slice(offset, offset + FLOW_CHUNK_SIZE);
-              sendQueue = sendQueue.then(() => ws.send(chunk)).catch(() => { });
-              offset += FLOW_CHUNK_SIZE;
-            }
-          } else {
-            sendQueue = sendQueue.then(() => ws.send(returnData)).catch(() => { });
+        // 这是对上传(pend)队列的反压。如果上传队列 > 2MB，就暂停下载。
+        if (pendBytes > MAX_PENDING) { await new Promise(res => setTimeout(res, 100)); continue; }
+        const { done, value: v } = await r.read();
+        if (v?.length) {
+          rxBytes += v.length; lastAct = Date.now(); stalls = 0; updateMode(v.length); const now = Date.now();
+          if (now - lastChk > 5000) {
+            const el = now - lastChk, by = rxBytes - lastRx, tp = by / el;
+            if (tp > 500) score = Math.min(1.0, score + 0.05);
+            else if (tp < 50) score = Math.max(0.1, score - 0.05);
+            lastChk = now; lastRx = rxBytes;
           }
+          if (mode === 'buffered') {
+            if (v.length < 32768) {
+              batch.push(v); bSz += v.length;
+              if (bSz >= 131072) flush();
+              else if (!bTmr) bTmr = setTimeout(flush, avgSz > 16384 ? 5 : 20);
+            } else { flush(); if (ws.readyState === 1) ws.send(v); }
+          } else if (mode === 'adaptive') {
+            if (v.length < 4096) {
+              batch.push(v); bSz += v.length;
+              if (bSz >= 32768) flush();
+              else if (!bTmr) bTmr = setTimeout(flush, 15);
+            } else { flush(); if (ws.readyState === 1) ws.send(v); }
+          } else { // mode === 'direct'
+            flush(); if (ws.readyState === 1) ws.send(v); 
+          }
+        } if (done) { flush(); reading = false; reconn(); break; }
+      }} catch (e) { flush(); if (bTmr) clearTimeout(bTmr); reading = false; fail++; reconn(); }
+  };
+
+  // --- ADDED (Problem 2) ---
+  // 专用的上传循环，用于异步处理 'pend' 队列
+  const writeLoop = async () => {
+    if (writing) return; 
+    writing = true;
+    try {
+      while(writing) { // 检查标志以允许安全停止
+        if (!w) { // 检查 writer 是否存在
+          await new Promise(res => setTimeout(res, 100));
+          continue;
         }
-        if (streamEnd) break;
-      }
-    }
-  } catch (e) {
-    return new Response(`Handshake failed: ${e}`, { status: 500 });
-  }
-}
-
-async function createSocks5Connection(addrType, destHost, destPort, socks5Spec) {
-  let socks5Conn, convertedHost, writer, reader;
-  try {
-    const { username, password, host, port } = getSocks5Account(socks5Spec);
-    socks5Conn = connect({ hostname: host, port: port });
-    await socks5Conn.opened;
-    writer = socks5Conn.writable.getWriter();
-    reader = socks5Conn.readable.getReader();
-    const encoder = new TextEncoder();
-    const authReq = new Uint8Array([5, 2, 0, 2]);
-    await writer.write(authReq);
-    const authResp = (await reader.read()).value;
-    if (authResp[1] === 0x02) {
-      if (!username || !password) {
-        throw new Error(`missing username or password`);
-      }
-      const userPassPacket = new Uint8Array([1, username.length, ...encoder.encode(username), password.length, ...encoder.encode(password)]);
-      await writer.write(userPassPacket);
-      const userPassResp = (await reader.read()).value;
-      if (userPassResp[0] !== 0x01 || userPassResp[1] !== 0x00) {
-        throw new Error(`username/password error`);
-      }
-    }
-    switch (addrType) {
-      case 1:
-        convertedHost = new Uint8Array([1, ...destHost.split('.').map(Number)]);
-        break;
-      case 2:
-        convertedHost = new Uint8Array([3, destHost.length, ...encoder.encode(destHost)]);
-        break;
-      case 3:
-        convertedHost = toSocks5IPv6(destHost);
-        function toSocks5IPv6(original) {
-          const trim = original.startsWith('[') && original.endsWith(']') ? original.slice(1, -1) : original;
-          const parts = trim.split('::');
-          const prefix = parts[0] ? parts[0].split(':').filter(Boolean) : [];
-          const suffix = parts[1] ? parts[1].split(':').filter(Boolean) : [];
-          const fillCount = 8 - (prefix.length + suffix.length);
-          if (fillCount < 0) throw new Error('invalid ipv6');
-          const full = [...prefix, ...Array(fillCount).fill('0'), ...suffix];
-          const bytes = full.flatMap(field => {
-            const val = parseInt(field || '0', 16);
-            return [(val >> 8) & 0xff, val & 0xff];
-          });
-          return new Uint8Array([0x04, ...bytes]);
+        if (pend.length === 0) { // 队列为空时等待
+          await new Promise(res => setTimeout(res, 20));
+          continue;
         }
-        break;
+        
+        const b = pend.shift();
+        await w.write(b); // await write，提供自然反压
+        pendBytes -= b.length; 
+        pool.free(b);
+      }
+    } catch (e) {
+      writing = false;
+      // 写入失败 (例如 socket 关闭), readLoop 或 keepalive 会触发 reconn
     }
-    const buildReq = new Uint8Array([5, 1, 0, ...convertedHost, destPort >> 8, destPort & 0xff]);
-    await writer.write(buildReq);
-    const checkResp = (await reader.read()).value;
-    if (checkResp[0] !== 0x05 || checkResp[1] !== 0x00) {
-      throw new Error(`target connection failed, destHost: ${destHost}, addrType: ${addrType}`);
+  };
+  // --- END ADDED ---
+  
+  const attemptConnection = async () => {
+    const connectionMethods = ['direct'];
+    if (proxyIPConfig) {
+      connectionMethods.push('proxy');
     }
-    writer.releaseLock();
-    reader.releaseLock();
-    return socks5Conn;
-  } catch {
-    console.log('SOCKS5 account failed')
-  }
-  writer?.releaseLock();
-  reader?.releaseLock();
-  await socks5Conn?.close();
-  throw new Error(`SOCKS5 account failed`);
-}
+    let lastError;
+    for (const method of connectionMethods) {
+      try {
+        const connectOpts = (method === 'direct')
+          ? { hostname: info.host, port: info.port }
+          : { hostname: proxyIPConfig.address, port: proxyIPConfig.port };
+        
+        const sock = connect(connectOpts);
+        await sock.opened;
+        return sock;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError || new Error('All connection methods failed.');
+  };
 
-function getSocks5Account(spec) {
-  const [latter, former] = spec.split(/@?([\d\[\]a-z.:]+(?::\d+)?)$/i);
-  let [username, password] = latter.split(':');
-  if (!password) { password = '' };
-  const [host, port] = parseHostPort(former);
-  return { username, password, host, port };
-}
+  const establish = async () => { 
+    try {
+      sock = await attemptConnection(); 
+      w = sock.writable.getWriter(); r = sock.readable.getReader(); 
+      // --- REMOVED (Problem 2) ---
+      // 移除原有的 pend.splice 逻辑，writeLoop 会处理
+      // --- END REMOVED ---
+      conn = false; reconns = 0; score = Math.min(1.0, score + 0.15); succ++; lastAct = Date.now(); 
+      readLoop();
+      writeLoop(); // <-- ADDED (Problem 2): 启动上传循环
+    } catch (e) { 
+      conn = false; fail++; score = Math.max(0.1, score - 0.2); 
+      reconn(); 
+    }
+  };
 
-function parseHostPort(hostSeg) {
-  let host, ipv6, port;
-  if (hostSeg.startsWith('[') && hostSeg.includes(']')) {
-    [ipv6, port = 443] = hostSeg.split(']:');
-    host = ipv6.endsWith(']') ? `${ipv6}` : `${ipv6}]`;
-  } else {
-    [host, port = 443] = hostSeg.split(':');
-  }
-  return [host, Number(port)];
-}
+  const reconn = async () => {
+    if (!info || ws.readyState !== 1) { cleanup(); ws.close(1011, 'Invalid.'); return; }
+    if (reconns >= MAX_RECONN) { cleanup(); ws.close(1011, 'Max reconnect.'); return; }
+    if (score < 0.3 && reconns > 5 && Math.random() > 0.6) { cleanup(); ws.close(1011, 'Poor network.'); return; }
+    if (conn) return; reconns++; let d = Math.min(50 * Math.pow(1.5, reconns - 1), 3000);
+    d *= (1.5 - score * 0.5); d += (Math.random() - 0.5) * d * 0.2; d = Math.max(50, Math.floor(d));
+    try {
+      cleanSock();
+      if (pendBytes > MAX_PENDING * 2) {
+        while (pendBytes > MAX_PENDING && pend.length > 5) { const drop = pend.shift(); pendBytes -= drop.length; pool.free(drop); }
+      }
+      await new Promise(res => setTimeout(res, d)); conn = true;
+      
+      sock = await attemptConnection(); 
+
+      w = sock.writable.getWriter(); r = sock.readable.getReader();
+      // --- REMOVED (Problem 2) ---
+      // 移除原有的 pend.splice 逻辑
+      // --- END REMOVED ---
+      conn = false; reconns = 0; score = Math.min(1.0, score + 0.15); succ++; stalls = 0; lastAct = Date.now(); 
+      readLoop();
+      writeLoop(); // <-- ADDED (Problem 2): 重启上传循环
+    } catch (e) { 
+      conn = false; fail++; score = Math.max(0.1, score - 0.2);
+      if (reconns < MAX_RECONN && ws.readyState === 1) setTimeout(reconn, 500);
+      else { cleanup(); ws.close(1011, 'Exhausted.'); }
+    }
+  };
+
+  const startTmrs = () => {
+    tmrs.ka = setInterval(async () => {
+      if (!conn && w && Date.now() - lastAct > KEEPALIVE) { try { await w.write(new Uint8Array(0)); lastAct = Date.now(); } catch (e) { reconn(); }}
+    }, KEEPALIVE / 3);
+    tmrs.hc = setInterval(() => {
+      if (!conn && stats.tot > 0 && Date.now() - lastAct > STALL_TO) { stalls++;
+        if (stalls >= MAX_STALL) {
+          if (reconns < MAX_RECONN) { stalls = 0; reconn(); }
+          else { cleanup(); ws.close(1011, 'Stall.'); }
+        }}}, STALL_TO / 2);
+  };
+  
+  const cleanSock = () => { 
+    reading = false; 
+    writing = false; // <-- ADDED (Problem 2): 停止 writeLoop
+    try { w?.releaseLock(); r?.releaseLock(); sock?.close(); } catch {} 
+  };
+  
+  const cleanup = () => {
+    Object.values(tmrs).forEach(clearInterval); cleanSock();
+    while (pend.length) pool.free(pend.shift());
+    pendBytes = 0; stats = { tot: 0, cnt: 0, big: 0, win: 0, ts: Date.now() };
+    mode = 'buffered'; // <-- MODIFIED (Problem 1): 重置回 buffered
+    avgSz = 0; tputs = []; pool.reset();
+  };
+  
+  ws.addEventListener('message', async e => {
+    try {
+      if (first) {
+        first = false; const b = new Uint8Array(e.data);
+        if (buildUUID(b, 1) !== UUID) throw new Error('Auth failed.');
+        const { host, port, payload } = extractAddr(b); 
+        info = { host, port }; 
+        conn = true; 
+        if (payload.length) { const buf = pool.alloc(payload.length); buf.set(payload); pend.push(buf); pendBytes += buf.length; } 
+        startTmrs(); 
+        establish(); 
+      } else { 
+        // --- MODIFIED (Problem 2) ---
+        // 消息处理器不再 'await write'，而是始终缓冲到 'pend' 队列
+        lastAct = Date.now();
+        
+        // 为上传队列设置硬上限 (约 4MB)，防止内存耗尽
+        if (pendBytes > MAX_PENDING * 2) { 
+          console.log('Upload buffer full, dropping packet');
+          return; // 丢弃新包
+        }
+        
+        const buf = pool.alloc(e.data.byteLength); 
+        buf.set(new Uint8Array(e.data)); 
+        pend.push(buf); 
+        pendBytes += buf.length;
+        // --- END MODIFIED ---
+      }
+    } catch (err) { 
+      cleanup(); ws.close(1006, 'Error.'); 
+    }
+  }); 
+  
+  ws.addEventListener('close', cleanup); ws.addEventListener('error', cleanup);
+};
