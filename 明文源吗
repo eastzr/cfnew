@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
-let authToken = '1f9d104e-ca0e-4202-ba4b-a0afb969c747';
+let authToken = '351c9981-04b6-4103-aa4b-864aa9c91469';
 let fallbackAddress = 'ProxyIP.SG.CMLiussss.net';
 let fallbackPort = '443';
 let socks5Config = '';
@@ -1602,7 +1602,7 @@ async function handleSubscriptionPage(request, user = null) {
                     <div style="margin-bottom: 15px;">
                         <label style="display: block; margin-bottom: 8px; color: #00ff00; font-weight: bold; text-shadow: 0 0 3px #00ff00;">TLS控制 (dkby):</label>
                         <select id="portControl" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #00ff00; color: #00ff00; font-family: 'Courier New', monospace; font-size: 14px;">
-                            <option value="">默认（保留所有节点）</option>
+                            <option value="yes">默认（保留所有节点）</option>
                             <option value="yes">仅TLS节点</option>
                         </select>
                         <small style="color: #00aa00; font-size: 0.85rem;">设置为"仅TLS节点"时只生成带TLS的节点，不生成非TLS节点（如80端口）</small>
